@@ -13,10 +13,11 @@ import posixpath
 import re
 import subprocess
 import sys
+import time
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
-from typing import Sequence
+from typing import Callable, Mapping, Sequence
 from urllib.parse import quote, unquote, urlparse
 
 
@@ -33,6 +34,7 @@ IMAGE_EXTENSIONS = {
     ".tiff",
     ".webp",
 }
+GENERATED_BINARY_IMAGE_EXTENSIONS = IMAGE_EXTENSIONS - {".svg"}
 
 MARKDOWN_LINK_START_RE = re.compile(r"(!?)\[([^\]]*)\]\(")
 REFERENCE_DEFINITION_RE = re.compile(
@@ -184,11 +186,11 @@ def is_probably_text(data: bytes) -> bool:
     return b"\0" not in data
 
 
-def current_snapshot(repo_root: Path, scopes: Sequence[str]) -> Snapshot:
+def tracked_file_oids(repo_root: Path) -> dict[str, str]:
+    """Return stage-zero tracked paths and blob IDs without reading file contents."""
     raw = run_git(repo_root, ["ls-files", "-s", "-z"])
     assert isinstance(raw, bytes)
-    files: dict[str, str] = {}
-    text_entries: list[tuple[str, str]] = []
+    tracked: dict[str, str] = {}
 
     for record in raw.decode("utf-8").split("\0"):
         if not record:
@@ -197,10 +199,16 @@ def current_snapshot(repo_root: Path, scopes: Sequence[str]) -> Snapshot:
         _mode, oid, stage = metadata.split()
         if stage != "0":
             continue
-        if path_in_scopes(path, scopes):
-            files[path] = oid
-        if not is_image_path(path):
-            text_entries.append((path, oid))
+        tracked[path] = oid
+    return tracked
+
+
+def current_snapshot(repo_root: Path, scopes: Sequence[str]) -> Snapshot:
+    tracked = tracked_file_oids(repo_root)
+    files = {path: oid for path, oid in tracked.items() if path_in_scopes(path, scopes)}
+    text_entries = [
+        (path, oid) for path, oid in tracked.items() if not is_image_path(path)
+    ]
 
     text_files: dict[str, str] = {}
     for path, oid in text_entries:
@@ -556,7 +564,11 @@ def normalize_generated_target(source: str, target: str) -> str | None:
     return "content/" + normalized
 
 
-def generated_site_references(site_root: Path, assets: set[str]) -> set[str]:
+def generated_site_references(
+    site_root: Path,
+    assets: set[str],
+    progress: Callable[[str], None] | None = None,
+) -> set[str]:
     """Return tracked content assets referenced by rendered site text."""
     if not site_root.is_dir():
         raise SystemExit(f"Generated site directory does not exist: {site_root}")
@@ -567,17 +579,25 @@ def generated_site_references(site_root: Path, assets: set[str]) -> set[str]:
 
     used: set[str] = set()
     found_html = False
+    files_seen = 0
+    text_files_scanned = 0
     for path in sorted(site_root.rglob("*")):
         if not path.is_file():
             continue
+        files_seen += 1
+        if progress and files_seen % 1000 == 0:
+            progress(f"Examined {files_seen} rendered files...")
         if path.suffix.lower() == ".html":
             found_html = True
+        if path.suffix.lower() in GENERATED_BINARY_IMAGE_EXTENSIONS:
+            continue
         try:
             data = path.read_bytes()
         except OSError:
             continue
         if not is_probably_text(data):
             continue
+        text_files_scanned += 1
         text = data.decode("utf-8", errors="replace")
         source = path.relative_to(site_root).as_posix()
         for match in GENERATED_IMAGE_TOKEN_RE.finditer(text):
@@ -588,6 +608,11 @@ def generated_site_references(site_root: Path, assets: set[str]) -> set[str]:
                 used.add(resolved)
             else:
                 used.update(by_casefold.get(resolved.casefold(), []))
+    if progress:
+        progress(
+            f"Rendered-site scan checked {text_files_scanned} text files "
+            f"and skipped {files_seen - text_files_scanned} non-text files."
+        )
     if not found_html:
         raise SystemExit(
             f"Generated site contains no HTML files; refusing confidence upgrade: {site_root}"
@@ -901,7 +926,13 @@ def analysis_json(
     analysis: Analysis,
     problems: Sequence[Problem],
     changes: Sequence[Change] = (),
+    file_oids: Mapping[str, str] | None = None,
 ) -> str:
+    safe_deletion_oids = {
+        path: file_oids[path]
+        for path in analysis.safe_delete_images
+        if file_oids is not None and path in file_oids
+    }
     return json.dumps(
         {
             "summary": {
@@ -915,6 +946,7 @@ def analysis_json(
                 "reported_problems": len(problems),
             },
             "safe_deletions": analysis.safe_delete_images,
+            "safe_deletion_oids": safe_deletion_oids,
             "needs_review": needs_review_records(analysis),
             "problems": [asdict(problem) for problem in problems],
             "changes": [asdict(change) for change in changes],
@@ -922,6 +954,74 @@ def analysis_json(
         indent=2,
         sort_keys=True,
     ) + "\n"
+
+
+def cleanup_manifest_paths(
+    baseline_path: Path,
+    tracked_files: Mapping[str, str],
+    scopes: Sequence[str],
+) -> list[str]:
+    """Validate and return rendered-safe paths whose image blobs are unchanged."""
+    try:
+        baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit(f"Cannot read cleanup manifest {baseline_path}: {error}") from error
+    if not isinstance(baseline, dict):
+        raise SystemExit("Cleanup manifest must be a JSON object")
+
+    errors: list[str] = []
+    summary = baseline.get("summary")
+    if not isinstance(summary, dict) or summary.get("generated_site_checked") is not True:
+        errors.append("manifest was not produced by a rendered-site audit")
+
+    raw_paths = baseline.get("safe_deletions")
+    raw_oids = baseline.get("safe_deletion_oids")
+    if not isinstance(raw_paths, list):
+        errors.append("safe_deletions must be a list")
+        raw_paths = []
+    if not isinstance(raw_oids, dict):
+        errors.append("safe_deletion_oids must be an object")
+        raw_oids = {}
+
+    paths: list[str] = []
+    seen: set[str] = set()
+    for raw_path in raw_paths:
+        if not isinstance(raw_path, str):
+            errors.append("safe_deletions contains a non-string path")
+            continue
+        path = PurePosixPath(raw_path)
+        if path.is_absolute() or ".." in path.parts:
+            errors.append(f"unsafe cleanup path: {raw_path}")
+            continue
+        normalized = path.as_posix()
+        if normalized in seen:
+            errors.append(f"duplicate cleanup path: {normalized}")
+            continue
+        seen.add(normalized)
+        paths.append(normalized)
+
+        if not path_in_scopes(normalized, scopes):
+            errors.append(f"cleanup path is outside the requested scopes: {normalized}")
+        if not is_image_path(normalized):
+            errors.append(f"cleanup path is not a supported image: {normalized}")
+        actual_oid = tracked_files.get(normalized)
+        expected_oid = raw_oids.get(normalized)
+        if actual_oid is None:
+            errors.append(f"cleanup path is no longer tracked: {normalized}")
+        elif not isinstance(expected_oid, str):
+            errors.append(f"cleanup path has no audited blob ID: {normalized}")
+        elif actual_oid != expected_oid:
+            errors.append(f"cleanup path changed after the audit: {normalized}")
+
+    extra_oids = sorted(set(raw_oids) - set(paths))
+    if extra_oids:
+        errors.append(
+            "manifest contains blob IDs for paths outside safe_deletions: "
+            + ", ".join(extra_oids)
+        )
+    if errors:
+        raise SystemExit("Cleanup manifest validation failed:\n- " + "\n- ".join(errors))
+    return paths
 
 
 def verify_cleanup(
@@ -1226,6 +1326,52 @@ def analysis_markdown(
     return "\n".join(lines) + "\n"
 
 
+def cleanup_changes_report(
+    changes: Sequence[Change],
+    output_format: str,
+    repository_url: str = "",
+    revision: str = "",
+) -> str:
+    """Return a report for a manifest application without rerunning the audit."""
+    if output_format == "json":
+        return json.dumps(
+            {"changes": [asdict(change) for change in changes]},
+            indent=2,
+            sort_keys=True,
+        ) + "\n"
+
+    if output_format == "markdown":
+        lines = ["### Applied cleanup manifest", ""]
+        if not changes:
+            lines.append("The verified manifest contained no safe deletions.")
+        else:
+            lines.append(f"Staged {len(changes)} verified image deletion(s).")
+            lines.append("")
+            for change in changes:
+                link = github_file_link(
+                    repository_url,
+                    revision,
+                    change.path,
+                    change.line,
+                )
+                lines.append(f"- `{change.kind}`: {link}")
+        return "\n".join(lines) + "\n"
+
+    lines = ["Applied cleanup manifest", ""]
+    if not changes:
+        lines.append("No safe deletions were present.")
+    else:
+        lines.extend(f"- {change.kind}: {change.path}" for change in changes)
+    return "\n".join(lines) + "\n"
+
+
+def write_cli_output(repo_root: Path, raw_path: str, output: str) -> None:
+    path = Path(raw_path)
+    if not path.is_absolute():
+        path = repo_root / path
+    path.write_text(output, encoding="utf-8")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Report malformed, missing, case-mismatched, and unreferenced images."
@@ -1266,6 +1412,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--apply-cleanup",
+        metavar="BASELINE_JSON",
+        help=(
+            "Stage only the safe deletions in a rendered JSON audit after verifying "
+            "that every tracked image still has its audited Git blob ID."
+        ),
+    )
+    parser.add_argument(
         "--verify-cleanup",
         metavar="BASELINE_JSON",
         help=(
@@ -1289,10 +1443,25 @@ def parse_args() -> argparse.Namespace:
         help="Git revision used to make Markdown report paths clickable.",
     )
     parser.add_argument("--output", help="Write the report to this file.")
+    parser.add_argument(
+        "--json-output",
+        help="Also write the current analysis as JSON without running a second audit.",
+    )
     parser.add_argument("--repo-root", default=".")
     args = parser.parse_args()
-    if args.verify_cleanup and (args.fix_references or args.delete_safe):
+    changing_modes = sum(
+        bool(mode) for mode in (args.fix_references, args.delete_safe, args.apply_cleanup)
+    )
+    if changing_modes > 1:
+        parser.error(
+            "--fix-references, --delete-safe, and --apply-cleanup are mutually exclusive"
+        )
+    if args.verify_cleanup and changing_modes:
         parser.error("--verify-cleanup cannot be combined with file-changing modes")
+    if args.apply_cleanup and args.generated_site:
+        parser.error("--apply-cleanup uses rendered evidence from its JSON manifest")
+    if args.apply_cleanup and args.json_output:
+        parser.error("--json-output is not available with --apply-cleanup")
     return args
 
 
@@ -1307,6 +1476,34 @@ def main() -> int:
     args = parse_args()
     repo_root = find_repo_root(args.repo_root)
     scopes = tuple(PurePosixPath(path).as_posix().rstrip("/") for path in args.paths)
+
+    def progress(message: str) -> None:
+        print(f"[image-integrity] {message}", file=sys.stderr, flush=True)
+
+    if args.apply_cleanup:
+        baseline_path = Path(args.apply_cleanup)
+        if not baseline_path.is_absolute():
+            baseline_path = repo_root / baseline_path
+        tracked_files = tracked_file_oids(repo_root)
+        paths = cleanup_manifest_paths(
+            baseline_path.resolve(),
+            tracked_files,
+            scopes,
+        )
+        progress(f"Applying {len(paths)} blob-verified deletion(s) from the manifest.")
+        changes = delete_safe_images(repo_root, paths, tuple(tracked_files))
+        output = cleanup_changes_report(
+            changes,
+            args.format,
+            args.repository_url,
+            args.revision,
+        )
+        if args.output:
+            write_cli_output(repo_root, args.output, output)
+        else:
+            print(output, end="")
+        return 0
+
     generated_site: Path | None = None
     if args.generated_site:
         generated_site = Path(args.generated_site)
@@ -1314,13 +1511,28 @@ def main() -> int:
             generated_site = repo_root / generated_site
         generated_site = generated_site.resolve()
 
+    scan_number = 0
+
     def analyze_current() -> tuple[Snapshot, Analysis]:
+        nonlocal scan_number
+        scan_number += 1
+        started = time.monotonic()
+        progress(f"Starting analysis pass {scan_number}.")
         snapshot = current_snapshot(repo_root, scopes)
         generated_used = None
         if generated_site is not None:
             assets = {path for path in snapshot.files if is_image_path(path)}
-            generated_used = generated_site_references(generated_site, assets)
-        return snapshot, analyze(snapshot, generated_used)
+            generated_used = generated_site_references(
+                generated_site,
+                assets,
+                progress,
+            )
+        result = analyze(snapshot, generated_used)
+        progress(
+            f"Analysis pass {scan_number} completed in "
+            f"{time.monotonic() - started:.1f}s."
+        )
+        return snapshot, result
 
     current_snapshot_value, current = analyze_current()
     changes: list[Change] = []
@@ -1351,8 +1563,14 @@ def main() -> int:
             current,
         )
 
+    json_output = analysis_json(
+        current,
+        reported,
+        changes,
+        current_snapshot_value.files,
+    )
     if args.format == "json":
-        output = analysis_json(current, reported, changes)
+        output = json_output
     elif args.format == "markdown":
         output = analysis_markdown(
             current,
@@ -1365,9 +1583,11 @@ def main() -> int:
         output = analysis_text(current, reported, changes)
 
     if args.output:
-        (repo_root / args.output).write_text(output, encoding="utf-8")
+        write_cli_output(repo_root, args.output, output)
     else:
         print(output, end="")
+    if args.json_output:
+        write_cli_output(repo_root, args.json_output, json_output)
 
     for error in verification_errors:
         print(f"Cleanup verification failed: {error}", file=sys.stderr)
