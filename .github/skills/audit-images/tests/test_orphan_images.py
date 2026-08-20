@@ -132,6 +132,18 @@ diagram: frontmatter.png
         self.assertEqual(analysis.orphan_images, [duplicate])
         self.assertEqual(analysis.safe_delete_images, [duplicate])
         self.assertEqual(analysis.duplicate_orphans, {duplicate: (used,)})
+        report = orphan_images.analysis_markdown(
+            analysis,
+            analysis.all_problems(),
+        )
+        self.assertIn("referenced byte-identical copies kept", report)
+        self.assertIn("delete only this unreferenced path", report)
+        self.assertEqual(
+            json.loads(
+                orphan_images.analysis_json(analysis, analysis.all_problems())
+            )["safe_deletions"],
+            [duplicate],
+        )
 
     def test_rendered_site_evidence_marks_unique_orphan_safe(self) -> None:
         image = "content/learning-paths/category/example/unused.png"
@@ -185,6 +197,62 @@ diagram: frontmatter.png
             structured["needs_review"][0]["related_references"][0]["source"],
             source,
         )
+
+    def test_json_report_lists_safe_deletion_paths(self) -> None:
+        image = "content/learning-paths/category/example/unused.png"
+        analysis = orphan_images.analyze(snapshot({image: b"unused"}), set())
+
+        structured = json.loads(
+            orphan_images.analysis_json(analysis, analysis.all_problems())
+        )
+
+        self.assertEqual(structured["safe_deletions"], [image])
+
+    def test_cleanup_verification_accepts_exact_staged_deletions(self) -> None:
+        image = "content/learning-paths/category/example/unused.png"
+        before = orphan_images.analyze(snapshot({image: b"unused"}), set())
+        after = orphan_images.analyze(snapshot({}), set())
+
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = Path(directory) / "before.json"
+            baseline.write_text(
+                orphan_images.analysis_json(before, before.all_problems()),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                orphan_images,
+                "run_git",
+                return_value=(image + "\0").encode("utf-8"),
+            ):
+                errors = orphan_images.verify_cleanup(Path(directory), baseline, after)
+
+        self.assertEqual(errors, [])
+
+    def test_cleanup_verification_rejects_wrong_deletion_and_new_problem(self) -> None:
+        image = "content/learning-paths/category/example/unused.png"
+        source = "content/learning-paths/category/example/guide.md"
+        before = orphan_images.analyze(snapshot({image: b"unused"}), set())
+        after = orphan_images.analyze(
+            snapshot({source: "![Missing](missing.png)\n"}),
+            set(),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = Path(directory) / "before.json"
+            baseline.write_text(
+                orphan_images.analysis_json(before, before.all_problems()),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                orphan_images,
+                "run_git",
+                return_value=b"content/learning-paths/category/example/other.png\0",
+            ):
+                errors = orphan_images.verify_cleanup(Path(directory), baseline, after)
+
+        self.assertTrue(any("expected deletions are missing" in error for error in errors))
+        self.assertTrue(any("unexpected deletions are staged" in error for error in errors))
+        self.assertTrue(any("new non-orphan problem" in error for error in errors))
 
     def test_markdown_report_links_review_image_and_source(self) -> None:
         source = "content/learning-paths/category/example/guide.md"

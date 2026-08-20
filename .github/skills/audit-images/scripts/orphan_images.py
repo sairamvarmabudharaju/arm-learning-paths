@@ -12,6 +12,7 @@ import json
 import posixpath
 import re
 import subprocess
+import sys
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
@@ -134,19 +135,29 @@ class Analysis:
 
     def all_problems(self) -> list[Problem]:
         safe = set(self.safe_delete_images)
-        orphan_problems = [
-            Problem(
-                kind="orphan",
-                path=path,
-                matches=self.duplicate_orphans.get(path, ()),
-                detail=(
-                    "safe automatic deletion"
-                    if path in safe
-                    else "needs review because evidence is incomplete or ambiguous"
-                ),
+        orphan_problems: list[Problem] = []
+        for path in self.orphan_images:
+            matches = self.duplicate_orphans.get(path, ())
+            if path not in safe:
+                detail = "needs review because evidence is incomplete or ambiguous"
+            elif matches:
+                detail = (
+                    "delete only this unreferenced path; byte-identical referenced "
+                    "copies are kept"
+                )
+            else:
+                detail = (
+                    "not referenced in tracked source or the rendered site; "
+                    "safe deletion proposal"
+                )
+            orphan_problems.append(
+                Problem(
+                    kind="orphan",
+                    path=path,
+                    matches=matches,
+                    detail=detail,
+                )
             )
-            for path in self.orphan_images
-        ]
         return sorted(
             self.problems + orphan_problems,
             key=problem_sort_key,
@@ -903,6 +914,7 @@ def analysis_json(
                 "generated_site_checked": analysis.generated_site_checked,
                 "reported_problems": len(problems),
             },
+            "safe_deletions": analysis.safe_delete_images,
             "needs_review": needs_review_records(analysis),
             "problems": [asdict(problem) for problem in problems],
             "changes": [asdict(change) for change in changes],
@@ -910,6 +922,69 @@ def analysis_json(
         indent=2,
         sort_keys=True,
     ) + "\n"
+
+
+def verify_cleanup(
+    repo_root: Path,
+    baseline_path: Path,
+    analysis: Analysis,
+) -> list[str]:
+    """Verify that a staged cleanup matches a rendered dry-run exactly."""
+    try:
+        baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        return [f"cannot read cleanup baseline {baseline_path}: {error}"]
+
+    errors: list[str] = []
+    if not baseline.get("summary", {}).get("generated_site_checked"):
+        errors.append("cleanup baseline was not produced by a rendered-site audit")
+    if not analysis.generated_site_checked:
+        errors.append("post-deletion audit did not inspect a rendered site")
+
+    expected = set(baseline.get("safe_deletions", []))
+    raw = run_git(
+        repo_root,
+        [
+            "diff",
+            "--cached",
+            "--name-only",
+            "--diff-filter=D",
+            "-z",
+            "HEAD",
+            "--",
+            *DEFAULT_PATHS,
+        ],
+    )
+    assert isinstance(raw, bytes)
+    actual = {path for path in raw.decode("utf-8").split("\0") if path}
+
+    missing = sorted(expected - actual)
+    unexpected = sorted(actual - expected)
+    if missing:
+        errors.append("expected deletions are missing: " + ", ".join(missing))
+    if unexpected:
+        errors.append("unexpected deletions are staged: " + ", ".join(unexpected))
+
+    before_non_orphans = {
+        json.dumps(problem, sort_keys=True)
+        for problem in baseline.get("problems", [])
+        if problem.get("kind") != "orphan"
+    }
+    after_non_orphans = {
+        json.dumps(asdict(problem), sort_keys=True)
+        for problem in analysis.problems
+        if problem.kind != "orphan"
+    }
+    introduced = sorted(after_non_orphans - before_non_orphans)
+    if introduced:
+        errors.append(
+            f"cleanup introduced {len(introduced)} new non-orphan problem(s)"
+        )
+    if analysis.safe_delete_images:
+        errors.append(
+            f"cleanup left {len(analysis.safe_delete_images)} safe deletion(s) behind"
+        )
+    return errors
 
 
 def analysis_text(
@@ -996,7 +1071,9 @@ def analysis_text(
                 message += f" -> {problem.target}"
             if problem.matches:
                 relationship = (
-                    "byte-identical to" if problem.kind == "orphan" else "tracked as"
+                    "referenced byte-identical copies kept"
+                    if problem.kind == "orphan"
+                    else "tracked as"
                 )
                 message += f" ({relationship} {', '.join(problem.matches)})"
             if problem.replacement:
@@ -1134,7 +1211,11 @@ def analysis_markdown(
             if problem.target:
                 message += f" requests `{problem.target}`"
             if problem.matches:
-                relationship = "byte-identical to" if kind == "orphan" else "tracked as"
+                relationship = (
+                    "referenced byte-identical copies kept"
+                    if kind == "orphan"
+                    else "tracked as"
+                )
                 matches = ", ".join(f"`{match}`" for match in problem.matches)
                 message += f" ({relationship} {matches})"
             if problem.replacement:
@@ -1185,6 +1266,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--verify-cleanup",
+        metavar="BASELINE_JSON",
+        help=(
+            "Verify that staged image deletions exactly match the safe-deletion "
+            "list from a rendered JSON report and introduce no new reference problems."
+        ),
+    )
+    parser.add_argument(
         "--format",
         choices=("text", "json", "markdown"),
         default="text",
@@ -1201,7 +1290,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output", help="Write the report to this file.")
     parser.add_argument("--repo-root", default=".")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.verify_cleanup and (args.fix_references or args.delete_safe):
+        parser.error("--verify-cleanup cannot be combined with file-changing modes")
+    return args
 
 
 def find_repo_root(raw_root: str) -> Path:
@@ -1248,6 +1340,16 @@ def main() -> int:
         current_snapshot_value, current = analyze_current()
 
     reported = current.all_problems()
+    verification_errors: list[str] = []
+    if args.verify_cleanup:
+        baseline_path = Path(args.verify_cleanup)
+        if not baseline_path.is_absolute():
+            baseline_path = repo_root / baseline_path
+        verification_errors = verify_cleanup(
+            repo_root,
+            baseline_path.resolve(),
+            current,
+        )
 
     if args.format == "json":
         output = analysis_json(current, reported, changes)
@@ -1267,7 +1369,10 @@ def main() -> int:
     else:
         print(output, end="")
 
-    return 1 if args.check and reported else 0
+    for error in verification_errors:
+        print(f"Cleanup verification failed: {error}", file=sys.stderr)
+
+    return 1 if verification_errors or (args.check and reported) else 0
 
 
 if __name__ == "__main__":
