@@ -66,6 +66,36 @@ Use path/guide-level review to:
 6. After the reviewer accepts suggestions, rewrite text, then re-run the audit on the same scope.
 7. Report before/after counts, files changed, and any remaining issues.
 
+## Orphan and reference-integrity workflow
+
+Use `scripts/orphan_images.py` when the task concerns unreferenced image files,
+broken local image paths, filename case mismatches, or malformed Markdown image
+destinations. This is separate from the alt-text audit so existing editorial
+findings do not block image-integrity checks.
+
+1. Run the checker in report mode before deleting anything.
+2. Run `scripts/orphan_images.py --fix-references` to repair deterministic
+   malformed, missing, and case-mismatched references. Review any ambiguous
+   references that remain instead of guessing.
+3. Render the site with Hugo and pass the output to `--generated-site`. The
+   checker combines tracked source references, rendered references, exact Git
+   blob matches, and unresolved-reference proximity to classify candidates.
+4. Run `--delete-safe` to remove only high-confidence candidates. Without a
+   rendered site, only byte-identical duplicates of referenced images qualify.
+5. Review only the smaller `needs review` group. Do not maintain a repository-wide
+   keep-list for historical candidates.
+6. Re-run the checker and Hugo build after cleanup.
+
+Case-colliding duplicate paths are removed from the Git index without deleting
+the shared worktree file on case-insensitive systems. GitHub Actions never edits
+or deletes contributor files. Ordinary content PRs run the fast source check
+against the base revision, so unchanged historical findings do not block a PR.
+The checker still builds a repository-wide reference index to catch cross-file
+effects such as deleting the only reference to an unchanged image, but it skips
+the expensive Hugo render. A manual workflow run performs the full rendered
+audit. Changes to layouts, themes, static assets, or Hugo configuration also
+select the full audit automatically because they can alter site-wide rendering.
+
 ## Validation rules
 
 - Treat the script as a detector, not the final authority. It flags likely problems for review.
@@ -100,3 +130,50 @@ Write JSON for tracking:
 ```bash
 python3 .github/skills/audit-images/scripts/audit_images.py --format json --output image-audit.json
 ```
+
+Report image-integrity problems without changing files:
+
+```bash
+python3 .github/skills/audit-images/scripts/orphan_images.py
+```
+
+Fail when any current problems exist:
+
+```bash
+python3 .github/skills/audit-images/scripts/orphan_images.py --check
+```
+
+Fail only for problems introduced since a Git reference:
+
+```bash
+python3 .github/skills/audit-images/scripts/orphan_images.py \
+  --check --changed-since origin/main
+```
+
+Apply deterministic reference repairs in bulk:
+
+```bash
+python3 .github/skills/audit-images/scripts/orphan_images.py --fix-references
+```
+
+Build the site and classify candidates with independent rendered evidence:
+
+```bash
+hugo --destination /tmp/arm-learning-paths-image-integrity
+python3 .github/skills/audit-images/scripts/orphan_images.py \
+  --generated-site /tmp/arm-learning-paths-image-integrity
+```
+
+Delete only candidates supported by the available confidence evidence:
+
+```bash
+python3 .github/skills/audit-images/scripts/orphan_images.py \
+  --generated-site /tmp/arm-learning-paths-image-integrity \
+  --delete-safe
+```
+
+Use the **Image integrity** workflow's **Run workflow** control and select
+`full` for a read-only Hugo-backed audit or `fast` for a change-aware source
+audit. Both modes remain inside the same workflow and publish their report in
+the run summary and as a downloadable artifact. Normal pull requests and pushes
+select the appropriate mode automatically.
