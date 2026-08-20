@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
@@ -110,6 +111,9 @@ diagram: frontmatter.png
         self.assertEqual(analysis.orphan_images, [image])
         self.assertEqual(analysis.safe_delete_images, [])
         self.assertEqual(analysis.needs_review_images, [image])
+        report = orphan_images.analysis_text(analysis, [])
+        self.assertIn("Awaiting full rendered classification: 1", report)
+        self.assertNotIn(f"- {image}", report)
 
     def test_exact_duplicate_orphan_is_safe_without_generated_site(self) -> None:
         source = "content/learning-paths/category/example/guide.md"
@@ -161,6 +165,52 @@ diagram: frontmatter.png
         self.assertEqual(analysis.safe_delete_images, [])
         self.assertEqual(analysis.needs_review_images, [image])
 
+    def test_reports_current_review_images_when_problem_list_is_empty(self) -> None:
+        source = "content/learning-paths/category/example/guide.md"
+        image = "content/learning-paths/category/example/screenshot.webp"
+        analysis = orphan_images.analyze(
+            snapshot({source: "![Screenshot](screenshot.png)\n", image: b"screen"}),
+            set(),
+        )
+
+        report = orphan_images.analysis_text(analysis, [])
+        structured = json.loads(orphan_images.analysis_json(analysis, []))
+
+        self.assertIn("Current images needing review (1)", report)
+        self.assertIn(image, report)
+        self.assertIn(f"{source}:1 -> screenshot.png", report)
+        self.assertIn("No actionable image-integrity problems found.", report)
+        self.assertEqual(structured["needs_review"][0]["path"], image)
+        self.assertEqual(
+            structured["needs_review"][0]["related_references"][0]["source"],
+            source,
+        )
+
+    def test_markdown_report_links_review_image_and_source(self) -> None:
+        source = "content/learning-paths/category/example/guide.md"
+        image = "content/learning-paths/category/example/screenshot.webp"
+        analysis = orphan_images.analyze(
+            snapshot({source: "![Screenshot](screenshot.png)\n", image: b"screen"}),
+            set(),
+        )
+
+        report = orphan_images.analysis_markdown(
+            analysis,
+            [],
+            repository_url="https://github.com/owner/repository",
+            revision="abc123",
+        )
+
+        self.assertIn(
+            "https://github.com/owner/repository/blob/abc123/" + image,
+            report,
+        )
+        self.assertIn(
+            "https://github.com/owner/repository/blob/abc123/" + source + "#L1",
+            report,
+        )
+        self.assertIn("Current images needing review (1)", report)
+
     def test_generated_site_reference_marks_asset_used(self) -> None:
         image = "content/learning-paths/category/example/rendered.png"
         absolute = "content/learning-paths/category/example/absolute.webp"
@@ -195,56 +245,6 @@ diagram: frontmatter.png
 
         self.assertEqual(analysis.orphan_images, [])
         self.assertEqual(analysis.problems, [])
-
-    def test_changed_since_reports_a_new_orphan_after_reference_removal(self) -> None:
-        image = "content/learning-paths/category/example/used.png"
-        source = "content/learning-paths/category/example/guide.md"
-        baseline = orphan_images.analyze(
-            snapshot({source: "![Used#center](used.png)\n", image: b"image"})
-        )
-        current = orphan_images.analyze(
-            snapshot({source: "The image was removed.\n", image: b"image"})
-        )
-
-        problems = orphan_images.new_problems(current, baseline)
-        self.assertEqual([(problem.kind, problem.path) for problem in problems], [("orphan", image)])
-
-    def test_changed_since_reports_orphan_when_reference_file_is_deleted(self) -> None:
-        image = "content/learning-paths/category/example/used.png"
-        source = "content/learning-paths/category/example/guide.md"
-        baseline = orphan_images.analyze(
-            snapshot({source: "![Used](used.png)\n", image: b"image"})
-        )
-        current = orphan_images.analyze(snapshot({image: b"image"}))
-
-        problems = orphan_images.new_problems(current, baseline)
-
-        self.assertEqual(
-            [(problem.kind, problem.path) for problem in problems],
-            [("orphan", image)],
-        )
-
-    def test_changed_since_reports_missing_reference_when_image_is_deleted(self) -> None:
-        image = "content/learning-paths/category/example/used.png"
-        source = "content/learning-paths/category/example/guide.md"
-        baseline = orphan_images.analyze(
-            snapshot({source: "![Used](used.png)\n", image: b"image"})
-        )
-        current = orphan_images.analyze(snapshot({source: "![Used](used.png)\n"}))
-
-        problems = orphan_images.new_problems(current, baseline)
-
-        self.assertEqual(
-            [(problem.kind, problem.path) for problem in problems],
-            [("missing_image", source)],
-        )
-
-    def test_changed_since_ignores_a_preexisting_orphan(self) -> None:
-        image = "content/learning-paths/category/example/unused.png"
-        baseline = orphan_images.analyze(snapshot({image: b"image"}))
-        current = orphan_images.analyze(snapshot({image: b"image"}))
-
-        self.assertEqual(orphan_images.new_problems(current, baseline), [])
 
     def test_repairs_duplicated_markdown_corruption(self) -> None:
         malformed = (

@@ -16,7 +16,7 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import Sequence
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 
 DEFAULT_PATHS = ("content/learning-paths", "content/install-guides")
@@ -98,7 +98,7 @@ class Problem:
     detail: str = ""
 
     def identity(self) -> tuple:
-        """Return a line-number-independent identity for baseline comparison."""
+        """Return a line-number-independent identity for problem deduplication."""
         if self.kind == "orphan":
             return (self.kind, self.path)
         return (
@@ -204,59 +204,6 @@ def current_snapshot(repo_root: Path, scopes: Sequence[str]) -> Snapshot:
             text_files[path] = data.decode("utf-8", errors="replace")
 
     return Snapshot(files=files, text=text_files, scopes=tuple(scopes))
-
-
-def ref_snapshot(repo_root: Path, ref: str, scopes: Sequence[str]) -> Snapshot:
-    raw = run_git(repo_root, ["ls-tree", "-r", "-z", ref])
-    assert isinstance(raw, bytes)
-    files: dict[str, str] = {}
-    text_oids: list[tuple[str, str]] = []
-
-    for record in raw.decode("utf-8").split("\0"):
-        if not record:
-            continue
-        metadata, path = record.split("\t", 1)
-        _mode, object_type, oid = metadata.split()
-        if object_type == "blob" and path_in_scopes(path, scopes):
-            files[path] = oid
-        if object_type == "blob" and not is_image_path(path):
-            text_oids.append((path, oid))
-
-    text_files = read_text_blobs(repo_root, text_oids)
-    return Snapshot(files=files, text=text_files, scopes=tuple(scopes))
-
-
-def read_text_blobs(repo_root: Path, entries: Sequence[tuple[str, str]]) -> dict[str, str]:
-    if not entries:
-        return {}
-
-    process = subprocess.Popen(
-        ["git", "-C", str(repo_root), "cat-file", "--batch"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-    )
-    assert process.stdin is not None
-    assert process.stdout is not None
-    result: dict[str, str] = {}
-
-    try:
-        for path, oid in entries:
-            process.stdin.write((oid + "\n").encode("ascii"))
-            process.stdin.flush()
-            header = process.stdout.readline().decode("ascii").strip().split()
-            if len(header) != 3 or header[1] != "blob":
-                continue
-            size = int(header[2])
-            data = process.stdout.read(size)
-            process.stdout.read(1)  # trailing newline from --batch
-            if is_probably_text(data):
-                result[path] = data.decode("utf-8", errors="replace")
-    finally:
-        process.stdin.close()
-        process.stdout.close()
-        process.wait()
-
-    return result
 
 
 def mask_fenced_code(text: str) -> str:
@@ -880,15 +827,68 @@ def problem_sort_key(problem: Problem) -> tuple:
     return (problem.kind, problem.path, problem.line, problem.target, problem.detail)
 
 
-def new_problems(current: Analysis, baseline: Analysis) -> list[Problem]:
-    baseline_ids = {problem.identity() for problem in baseline.all_problems()}
-    return [problem for problem in current.all_problems() if problem.identity() not in baseline_ids]
+def needs_review_records(analysis: Analysis) -> list[dict[str, object]]:
+    """Describe why each protected orphan needs human review."""
+    records: list[dict[str, object]] = []
+    missing = [problem for problem in analysis.problems if problem.kind == "missing_image"]
+
+    for path in analysis.needs_review_images:
+        related: list[dict[str, object]] = []
+        for problem in missing:
+            source_directory = posixpath.dirname(problem.path).rstrip("/") + "/"
+            if problem.replacement == path:
+                relationship = "unique nearby replacement"
+            elif not problem.replacement and path.startswith(source_directory):
+                relationship = "unresolved image in the same content directory"
+            else:
+                continue
+            related.append(
+                {
+                    "source": problem.path,
+                    "line": problem.line,
+                    "target": problem.target,
+                    "relationship": relationship,
+                }
+            )
+
+        if any(item["relationship"] == "unique nearby replacement" for item in related):
+            reason = "A missing image reference uniquely points to this nearby asset."
+            recommendation = "Fix the related reference before considering deletion."
+        elif related:
+            reason = "An unresolved missing reference exists in the same content directory."
+            recommendation = "Inspect the image and article to decide whether to link or delete it."
+        elif not analysis.generated_site_checked:
+            reason = "Rendered-site evidence is unavailable and this is not an exact duplicate."
+            recommendation = "Run the full rendered audit before making a deletion decision."
+        else:
+            reason = "Available evidence is incomplete or ambiguous."
+            recommendation = "Inspect the image and nearby content before changing it."
+
+        records.append(
+            {
+                "path": path,
+                "reason": reason,
+                "recommendation": recommendation,
+                "related_references": related,
+            }
+        )
+    return records
+
+
+def displayed_review_records(
+    analysis: Analysis,
+    records: Sequence[dict[str, object]],
+) -> tuple[list[dict[str, object]], int]:
+    """Separate actionable review details from candidates awaiting a full audit."""
+    if analysis.generated_site_checked:
+        return list(records), 0
+    displayed = [record for record in records if record["related_references"]]
+    return displayed, len(records) - len(displayed)
 
 
 def analysis_json(
     analysis: Analysis,
     problems: Sequence[Problem],
-    baseline: str = "",
     changes: Sequence[Change] = (),
 ) -> str:
     return json.dumps(
@@ -902,8 +902,8 @@ def analysis_json(
                 "duplicate_orphans": len(analysis.duplicate_orphans),
                 "generated_site_checked": analysis.generated_site_checked,
                 "reported_problems": len(problems),
-                "baseline": baseline,
             },
+            "needs_review": needs_review_records(analysis),
             "problems": [asdict(problem) for problem in problems],
             "changes": [asdict(change) for change in changes],
         },
@@ -915,10 +915,8 @@ def analysis_json(
 def analysis_text(
     analysis: Analysis,
     problems: Sequence[Problem],
-    baseline: str = "",
     changes: Sequence[Change] = (),
 ) -> str:
-    scope_label = f"New problems since {baseline}" if baseline else "All detected problems"
     lines: list[str] = []
     if changes:
         lines.extend(["Applied changes", ""])
@@ -942,9 +940,38 @@ def analysis_text(
             f"Exact duplicate orphans: {len(analysis.duplicate_orphans)}",
             "Generated site checked: "
             + ("yes" if analysis.generated_site_checked else "no"),
-            f"{scope_label}: {len(problems)}",
+            f"All detected problems: {len(problems)}",
         ]
     )
+
+    review_records = needs_review_records(analysis)
+    displayed_records, awaiting_render = displayed_review_records(
+        analysis,
+        review_records,
+    )
+    if displayed_records:
+        lines.extend(["", f"Current images needing review ({len(displayed_records)})"])
+        for record in displayed_records:
+            lines.append(f"- {record['path']}")
+            lines.append(f"  Reason: {record['reason']}")
+            for related in record["related_references"]:
+                source = related["source"]
+                line = related["line"]
+                target = related["target"]
+                relationship = related["relationship"]
+                lines.append(
+                    f"  Related reference: {source}:{line} -> {target} "
+                    f"({relationship})"
+                )
+            lines.append(f"  Recommended action: {record['recommendation']}")
+    if awaiting_render:
+        lines.extend(
+            [
+                "",
+                f"Awaiting full rendered classification: {awaiting_render}",
+                "Run the full audit before reviewing these candidates individually.",
+            ]
+        )
 
     if not problems:
         lines.extend(["", "No actionable image-integrity problems found."])
@@ -981,6 +1008,143 @@ def analysis_text(
     return "\n".join(lines) + "\n"
 
 
+def github_file_link(
+    repository_url: str,
+    revision: str,
+    path: str,
+    line: int = 0,
+) -> str:
+    """Return a Markdown link to a repository file when GitHub context is available."""
+    label = path + (f":{line}" if line else "")
+    if not repository_url or not revision:
+        return f"`{label}`"
+    url = (
+        f"{repository_url.rstrip('/')}/blob/{quote(revision, safe='')}/"
+        f"{quote(path, safe='/')}"
+    )
+    if line:
+        url += f"#L{line}"
+    return f"[`{label}`]({url})"
+
+
+def analysis_markdown(
+    analysis: Analysis,
+    problems: Sequence[Problem],
+    changes: Sequence[Change] = (),
+    repository_url: str = "",
+    revision: str = "",
+) -> str:
+    """Return a GitHub-friendly report with clickable repository paths."""
+    lines = [
+        "### Audit report",
+        "",
+        "| Metric | Count |",
+        "| --- | ---: |",
+        f"| Tracked images | {analysis.tracked_images} |",
+        f"| Referenced images | {analysis.referenced_images} |",
+        f"| Current orphan candidates | {len(analysis.orphan_images)} |",
+        f"| Safe automatic deletions | {len(analysis.safe_delete_images)} |",
+        f"| Needs review | {len(analysis.needs_review_images)} |",
+        f"| Exact duplicate orphans | {len(analysis.duplicate_orphans)} |",
+        "| Generated site checked | "
+        + ("yes" if analysis.generated_site_checked else "no")
+        + " |",
+        f"| All detected problems | {len(problems)} |",
+    ]
+
+    review_records = needs_review_records(analysis)
+    displayed_records, awaiting_render = displayed_review_records(
+        analysis,
+        review_records,
+    )
+    if awaiting_render:
+        lines.append(f"| Awaiting full rendered classification | {awaiting_render} |")
+    if displayed_records:
+        lines.extend(
+            [
+                "",
+                f"### Current images needing review ({len(displayed_records)})",
+                "",
+            ]
+        )
+        for record in displayed_records:
+            path = str(record["path"])
+            lines.append(f"- {github_file_link(repository_url, revision, path)}")
+            lines.append(f"  - **Why:** {record['reason']}")
+            for related in record["related_references"]:
+                source = str(related["source"])
+                line = int(related["line"])
+                target = related["target"]
+                relationship = related["relationship"]
+                source_link = github_file_link(
+                    repository_url,
+                    revision,
+                    source,
+                    line,
+                )
+                lines.append(
+                    f"  - **Related reference:** {source_link} requests `{target}` "
+                    f"({relationship})."
+                )
+            lines.append(f"  - **Recommended action:** {record['recommendation']}")
+    if awaiting_render:
+        lines.extend(
+            [
+                "",
+                f"> **{awaiting_render} additional candidates** are awaiting rendered-site "
+                "evidence. Run the full audit before reviewing them individually.",
+            ]
+        )
+
+    if changes:
+        lines.extend(["", "### Applied changes", ""])
+        for change in changes:
+            link = github_file_link(
+                repository_url,
+                revision,
+                change.path,
+                change.line,
+            )
+            lines.append(f"- `{change.kind}`: {link}")
+
+    lines.extend(["", "### All detected problems", ""])
+    if not problems:
+        lines.append("No actionable image-integrity problems found.")
+        return "\n".join(lines) + "\n"
+
+    grouped: dict[str, list[Problem]] = defaultdict(list)
+    for problem in problems:
+        grouped[problem.kind].append(problem)
+    labels = {
+        "case_mismatch": "Filename case mismatches",
+        "malformed_markdown": "Malformed Markdown image references",
+        "missing_image": "Missing referenced images",
+        "orphan": "Unreferenced image candidates",
+    }
+    for kind in sorted(grouped):
+        lines.extend(["", f"#### {labels.get(kind, kind.replace('_', ' ').title())}", ""])
+        for problem in grouped[kind]:
+            link = github_file_link(
+                repository_url,
+                revision,
+                problem.path,
+                problem.line,
+            )
+            message = f"- {link}"
+            if problem.target:
+                message += f" requests `{problem.target}`"
+            if problem.matches:
+                relationship = "byte-identical to" if kind == "orphan" else "tracked as"
+                matches = ", ".join(f"`{match}`" for match in problem.matches)
+                message += f" ({relationship} {matches})"
+            if problem.replacement:
+                message += f" (safe replacement: `{problem.replacement}`)"
+            if problem.detail:
+                message += f" — {problem.detail}"
+            lines.append(message)
+    return "\n".join(lines) + "\n"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Report malformed, missing, case-mismatched, and unreferenced images."
@@ -995,11 +1159,6 @@ def parse_args() -> argparse.Namespace:
         "--check",
         action="store_true",
         help="Exit with status 1 when reported problems exist.",
-    )
-    parser.add_argument(
-        "--changed-since",
-        metavar="GIT_REF",
-        help="Report only problems introduced since this Git reference.",
     )
     parser.add_argument(
         "--fix-references",
@@ -1025,13 +1184,24 @@ def parse_args() -> argparse.Namespace:
             "evidence, only exact duplicates of referenced images qualify."
         ),
     )
-    parser.add_argument("--format", choices=("text", "json"), default="text")
+    parser.add_argument(
+        "--format",
+        choices=("text", "json", "markdown"),
+        default="text",
+    )
+    parser.add_argument(
+        "--repository-url",
+        default="",
+        help="Repository URL used to make Markdown report paths clickable.",
+    )
+    parser.add_argument(
+        "--revision",
+        default="",
+        help="Git revision used to make Markdown report paths clickable.",
+    )
     parser.add_argument("--output", help="Write the report to this file.")
     parser.add_argument("--repo-root", default=".")
-    args = parser.parse_args()
-    if args.changed_since and (args.fix_references or args.delete_safe):
-        parser.error("--changed-since cannot be combined with file-changing modes")
-    return args
+    return parser.parse_args()
 
 
 def find_repo_root(raw_root: str) -> Path:
@@ -1077,17 +1247,20 @@ def main() -> int:
         )
         current_snapshot_value, current = analyze_current()
 
-    if args.changed_since:
-        baseline_snapshot = ref_snapshot(repo_root, args.changed_since, scopes)
-        baseline = analyze(baseline_snapshot)
-        reported = new_problems(current, baseline)
-    else:
-        reported = current.all_problems()
+    reported = current.all_problems()
 
     if args.format == "json":
-        output = analysis_json(current, reported, args.changed_since or "", changes)
+        output = analysis_json(current, reported, changes)
+    elif args.format == "markdown":
+        output = analysis_markdown(
+            current,
+            reported,
+            changes,
+            args.repository_url,
+            args.revision,
+        )
     else:
-        output = analysis_text(current, reported, args.changed_since or "", changes)
+        output = analysis_text(current, reported, changes)
 
     if args.output:
         (repo_root / args.output).write_text(output, encoding="utf-8")

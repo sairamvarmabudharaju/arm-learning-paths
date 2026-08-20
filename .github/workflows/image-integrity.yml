@@ -1,39 +1,12 @@
 name: Image integrity
 
 on:
-  pull_request:
-    paths:
-      - "content/**"
-      - "assets/**"
-      - "layouts/**"
-      - "static/**"
-      - "themes/**"
-      - "config*.toml"
-      - ".github/skills/audit-images/**"
-      - ".github/workflows/image-integrity.yml"
-  push:
-    paths:
-      - "content/**"
-      - "assets/**"
-      - "layouts/**"
-      - "static/**"
-      - "themes/**"
-      - "config*.toml"
-      - ".github/skills/audit-images/**"
-      - ".github/workflows/image-integrity.yml"
+  schedule:
+    - cron: "0 9 * * 1"
   workflow_dispatch:
-    inputs:
-      audit_mode:
-        description: "Choose a fast changed-reference audit or a full rendered audit"
-        required: true
-        default: "full"
-        type: choice
-        options:
-          - "full"
-          - "fast"
 
 concurrency:
-  group: image-integrity-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: image-integrity-${{ github.workflow }}
   cancel-in-progress: true
 
 env:
@@ -45,6 +18,7 @@ permissions:
 jobs:
   check-image-integrity:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Check out repository code
         uses: actions/checkout@v6
@@ -59,102 +33,38 @@ jobs:
       - name: Run image-integrity unit tests
         run: python3 -m unittest discover -s .github/skills/audit-images/tests -v
 
-      - name: Determine comparison revision
-        id: comparison
-        env:
-          BEFORE_SHA: ${{ github.event.before }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          EVENT_NAME: ${{ github.event_name }}
-          PULL_REQUEST_BASE: ${{ github.base_ref }}
-        run: |
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            comparison_ref="origin/$PULL_REQUEST_BASE"
-          elif git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
-            comparison_ref="$BEFORE_SHA"
-          else
-            comparison_ref="origin/$DEFAULT_BRANCH"
-          fi
-          echo "ref=$comparison_ref" >> "$GITHUB_OUTPUT"
-
-      - name: Select fast or full audit
-        id: audit-scope
-        env:
-          COMPARISON_REF: ${{ steps.comparison.outputs.ref }}
-          EVENT_NAME: ${{ github.event_name }}
-          MANUAL_AUDIT_MODE: ${{ inputs.audit_mode }}
-        run: |
-          full_audit=false
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            if [ "$MANUAL_AUDIT_MODE" = "full" ]; then
-              full_audit=true
-            fi
-          elif git diff --name-only "$COMPARISON_REF"...HEAD | \
-            grep -Eq '^(assets|layouts|static|themes)/|^config.*\.toml$'; then
-            full_audit=true
-          fi
-          echo "full=$full_audit" >> "$GITHUB_OUTPUT"
-
-      - name: Check changed image references
-        if: steps.audit-scope.outputs.full != 'true'
-        run: |
-          set -o pipefail
-          python3 .github/skills/audit-images/scripts/orphan_images.py \
-            --check \
-            --changed-since "${{ steps.comparison.outputs.ref }}" | \
-            tee image-integrity-report.txt
-
-      - name: Fetch Hugo theme for full audit
-        if: steps.audit-scope.outputs.full == 'true'
+      - name: Fetch Hugo theme
         run: git submodule update --init --recursive
 
-      - name: Set up Hugo for full audit
-        if: steps.audit-scope.outputs.full == 'true'
+      - name: Set up Hugo
         uses: peaceiris/actions-hugo@v3
         with:
           hugo-version: ${{ env.HUGO_VERSION }}
           extended: true
 
-      - name: Render the site for full audit
-        if: steps.audit-scope.outputs.full == 'true'
+      - name: Render the site
         run: hugo --destination "$RUNNER_TEMP/image-integrity-site"
 
       - name: Run full rendered audit
-        if: steps.audit-scope.outputs.full == 'true'
-        env:
-          COMPARISON_REF: ${{ steps.comparison.outputs.ref }}
-          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -o pipefail
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            python3 .github/skills/audit-images/scripts/orphan_images.py \
-              --generated-site "$RUNNER_TEMP/image-integrity-site" | \
-              tee image-integrity-report.txt
-          else
-            python3 .github/skills/audit-images/scripts/orphan_images.py \
-              --check \
-              --generated-site "$RUNNER_TEMP/image-integrity-site" \
-              --changed-since "$COMPARISON_REF" | \
-              tee image-integrity-report.txt
-          fi
+          python3 .github/skills/audit-images/scripts/orphan_images.py \
+            --generated-site "$RUNNER_TEMP/image-integrity-site" \
+            --format markdown \
+            --repository-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --revision "$GITHUB_SHA" | \
+            tee image-integrity-report.md
 
       - name: Publish image-integrity summary
         if: always()
-        env:
-          FULL_AUDIT: ${{ steps.audit-scope.outputs.full }}
         run: |
           echo "## Image integrity" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          if [ "$FULL_AUDIT" = "true" ]; then
-            echo "**Mode:** Full rendered audit" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "**Mode:** Fast changed-reference audit" >> "$GITHUB_STEP_SUMMARY"
-          fi
+          echo "**Mode:** Full rendered audit" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          if [ -f image-integrity-report.txt ]; then
-            echo '```text' >> "$GITHUB_STEP_SUMMARY"
-            sed -n '1,200p' image-integrity-report.txt >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            if [ "$(wc -l < image-integrity-report.txt)" -gt 200 ]; then
+          if [ -f image-integrity-report.md ]; then
+            sed -n '1,200p' image-integrity-report.md >> "$GITHUB_STEP_SUMMARY"
+            if [ "$(wc -l < image-integrity-report.md)" -gt 200 ]; then
               echo "Report truncated to 200 lines. Download the artifact for the complete report." >> "$GITHUB_STEP_SUMMARY"
             fi
           else
@@ -162,9 +72,9 @@ jobs:
           fi
 
       - name: Upload image-integrity report
-        if: always() && hashFiles('image-integrity-report.txt') != ''
+        if: always() && hashFiles('image-integrity-report.md') != ''
         uses: actions/upload-artifact@v4
         with:
           name: image-integrity-report
-          path: image-integrity-report.txt
-          retention-days: 7
+          path: image-integrity-report.md
+          retention-days: 14

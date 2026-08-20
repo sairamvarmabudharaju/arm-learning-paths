@@ -96,4 +96,4 @@ Preferred example:
 - Automatically delete only candidates classified as safe; review the smaller ambiguous group
 - Use `orphan_images.py --fix-references` for deterministic bulk repairs; leave ambiguous matches for review
 - Use `orphan_images.py --delete-safe` to remove only confidence-qualified candidates
-- Use the fast baseline-aware source check for normal content PRs and reserve the full Hugo-backed audit for manual runs or site-wide rendering changes
+- Run the full Hugo-backed audit weekly, or start it manually when an up-to-date report is needed

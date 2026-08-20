@@ -88,13 +88,11 @@ findings do not block image-integrity checks.
 
 Case-colliding duplicate paths are removed from the Git index without deleting
 the shared worktree file on case-insensitive systems. GitHub Actions never edits
-or deletes contributor files. Ordinary content PRs run the fast source check
-against the base revision, so unchanged historical findings do not block a PR.
-The checker still builds a repository-wide reference index to catch cross-file
-effects such as deleting the only reference to an unchanged image, but it skips
-the expensive Hugo render. A manual workflow run performs the full rendered
-audit. Changes to layouts, themes, static assets, or Hugo configuration also
-select the full audit automatically because they can alter site-wide rendering.
+or deletes contributor files. The Image integrity workflow performs one full,
+Hugo-rendered audit every Monday at 09:00 UTC. It can also be started manually
+with the workflow's **Run workflow** control. The scheduled audit is
+informational: it reports candidates for cleanup and review without modifying
+the repository or failing merely because historical candidates exist.
 
 ## Validation rules
 
@@ -143,13 +141,6 @@ Fail when any current problems exist:
 python3 .github/skills/audit-images/scripts/orphan_images.py --check
 ```
 
-Fail only for problems introduced since a Git reference:
-
-```bash
-python3 .github/skills/audit-images/scripts/orphan_images.py \
-  --check --changed-since origin/main
-```
-
 Apply deterministic reference repairs in bulk:
 
 ```bash
@@ -172,8 +163,13 @@ python3 .github/skills/audit-images/scripts/orphan_images.py \
   --delete-safe
 ```
 
-Use the **Image integrity** workflow's **Run workflow** control and select
-`full` for a read-only Hugo-backed audit or `fast` for a change-aware source
-audit. Both modes remain inside the same workflow and publish their report in
-the run summary and as a downloadable artifact. Normal pull requests and pushes
-select the appropriate mode automatically.
+Use the **Image integrity** workflow's **Run workflow** control to start the
+same full, read-only Hugo-backed audit without waiting for the weekly schedule.
+The workflow publishes its report in the run summary and as a downloadable
+artifact. Pushes and pull requests do not trigger this workflow.
+
+Every workflow report lists the actionable `needs review` group even when those
+images are historical. Markdown reports link each protected image and related
+source line, explain why automatic deletion was blocked, and recommend the next
+review action. The full audit uses both source references and the rendered Hugo
+site to avoid treating images used by published pages as safe to delete.
