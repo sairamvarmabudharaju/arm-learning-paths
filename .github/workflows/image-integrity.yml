@@ -1,4 +1,4 @@
-name: Image integrity
+name: Orphaned images cleanup
 
 on:
   schedule:
@@ -58,11 +58,8 @@ jobs:
           set -o pipefail
           python3 .github/skills/audit-images/scripts/orphan_images.py \
             --generated-site "$RUNNER_TEMP/image-integrity-site" \
-            --format json \
-            --output "$RUNNER_TEMP/image-integrity-before-cleanup.json"
-          python3 .github/skills/audit-images/scripts/orphan_images.py \
-            --generated-site "$RUNNER_TEMP/image-integrity-site" \
             --format markdown \
+            --json-output "$RUNNER_TEMP/image-integrity-before-cleanup.json" \
             --repository-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
             --revision "$GITHUB_SHA" | \
             tee image-integrity-report.md
@@ -85,15 +82,14 @@ jobs:
           fi
           echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
 
-      - name: Delete rendered-safe candidates on the proposal branch
+      - name: Apply the rendered-safe cleanup manifest
         if: steps.cleanup.outputs.enabled == 'true'
         id: cleanup-changes
         run: |
           set -o pipefail
           git switch -c "$CLEANUP_BRANCH"
           python3 .github/skills/audit-images/scripts/orphan_images.py \
-            --generated-site "$RUNNER_TEMP/image-integrity-site" \
-            --delete-safe \
+            --apply-cleanup "$RUNNER_TEMP/image-integrity-before-cleanup.json" \
             --format markdown \
             --repository-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
             --revision "$GITHUB_SHA" | \

@@ -91,7 +91,9 @@ the shared worktree file on case-insensitive systems. GitHub Actions never
 writes deletions directly to the default branch. The Image integrity workflow
 performs one full, Hugo-rendered audit every Monday at 09:00 UTC and creates or
 updates a bot-owned cleanup PR when safe candidates exist. It rebuilds Hugo and
-verifies the staged deletion set before pushing that proposal branch. The PR is
+verifies the staged deletion set before pushing that proposal branch. The
+workflow writes Markdown and JSON from one audit pass, then applies only
+manifest paths whose Git blob IDs still match the audited snapshot. The PR is
 never auto-merged, and `needs review` images remain untouched.
 
 ## Validation rules
@@ -181,7 +183,8 @@ The cleanup PR contains deletion-only content changes, links every proposed
 deletion at the audited commit, and links the protected review group. Before
 opening the PR, the workflow requires the staged deletions to exactly match the
 JSON dry-run manifest, rebuilds the complete site, and rejects any newly
-introduced non-orphan problem.
+introduced non-orphan problem. Rendered-site scans skip copied raster images
+before reading file contents while retaining text-based SVG reference checks.
 
 For a manual Git cleanup, build Hugo first and let the checker stage only the
 safe deletion set:

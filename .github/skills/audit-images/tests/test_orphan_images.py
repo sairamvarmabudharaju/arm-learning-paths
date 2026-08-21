@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -200,13 +201,65 @@ diagram: frontmatter.png
 
     def test_json_report_lists_safe_deletion_paths(self) -> None:
         image = "content/learning-paths/category/example/unused.png"
-        analysis = orphan_images.analyze(snapshot({image: b"unused"}), set())
+        state = snapshot({image: b"unused"})
+        analysis = orphan_images.analyze(state, set())
 
         structured = json.loads(
-            orphan_images.analysis_json(analysis, analysis.all_problems())
+            orphan_images.analysis_json(
+                analysis,
+                analysis.all_problems(),
+                file_oids=state.files,
+            )
         )
 
         self.assertEqual(structured["safe_deletions"], [image])
+        self.assertEqual(structured["safe_deletion_oids"], {image: state.files[image]})
+
+    def test_cleanup_manifest_accepts_unchanged_blob_ids(self) -> None:
+        image = "content/learning-paths/category/example/unused.png"
+        state = snapshot({image: b"unused"})
+        analysis = orphan_images.analyze(state, set())
+
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = Path(directory) / "before.json"
+            baseline.write_text(
+                orphan_images.analysis_json(
+                    analysis,
+                    analysis.all_problems(),
+                    file_oids=state.files,
+                ),
+                encoding="utf-8",
+            )
+            paths = orphan_images.cleanup_manifest_paths(
+                baseline,
+                state.files,
+                orphan_images.DEFAULT_PATHS,
+            )
+
+        self.assertEqual(paths, [image])
+
+    def test_cleanup_manifest_rejects_changed_blob_ids(self) -> None:
+        image = "content/learning-paths/category/example/unused.png"
+        state = snapshot({image: b"unused"})
+        analysis = orphan_images.analyze(state, set())
+
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = Path(directory) / "before.json"
+            baseline.write_text(
+                orphan_images.analysis_json(
+                    analysis,
+                    analysis.all_problems(),
+                    file_oids=state.files,
+                ),
+                encoding="utf-8",
+            )
+            changed = {image: "different-blob-id"}
+            with self.assertRaisesRegex(SystemExit, "changed after the audit"):
+                orphan_images.cleanup_manifest_paths(
+                    baseline,
+                    changed,
+                    orphan_images.DEFAULT_PATHS,
+                )
 
     def test_cleanup_verification_accepts_exact_staged_deletions(self) -> None:
         image = "content/learning-paths/category/example/unused.png"
@@ -299,6 +352,20 @@ diagram: frontmatter.png
         )
         self.assertEqual(generated, {image, absolute})
         self.assertEqual(analysis.orphan_images, [])
+
+    def test_generated_site_scan_ignores_paths_embedded_in_binary_assets(self) -> None:
+        image = "content/learning-paths/category/example/unused.png"
+        with tempfile.TemporaryDirectory() as directory:
+            site = Path(directory)
+            (site / "index.html").write_text("<p>No image reference</p>", encoding="utf-8")
+            (site / "copied.png").write_text(
+                "/learning-paths/category/example/unused.png",
+                encoding="utf-8",
+            )
+
+            generated = orphan_images.generated_site_references(site, {image})
+
+        self.assertEqual(generated, set())
 
     def test_empty_generated_site_cannot_upgrade_confidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -398,6 +465,104 @@ diagram: frontmatter.png
                 ("removed_duplicate_index_entry", lower),
             ],
         )
+
+    def test_cli_writes_both_reports_then_applies_verified_manifest(self) -> None:
+        image = "content/learning-paths/category/example/unused.png"
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            repository = temporary / "repository"
+            repository.mkdir()
+            subprocess.run(
+                ["git", "init", "-q", str(repository)],
+                check=True,
+            )
+            image_path = repository / image
+            image_path.parent.mkdir(parents=True)
+            image_path.write_bytes(b"unused image")
+            subprocess.run(
+                ["git", "-C", str(repository), "add", image],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repository),
+                    "-c",
+                    "user.name=Image Integrity Test",
+                    "-c",
+                    "user.email=image-integrity@example.invalid",
+                    "commit",
+                    "-qm",
+                    "Add test image",
+                ],
+                check=True,
+            )
+
+            generated_site = temporary / "site"
+            generated_site.mkdir()
+            (generated_site / "index.html").write_text(
+                "<p>No image reference</p>",
+                encoding="utf-8",
+            )
+            markdown_report = temporary / "report.md"
+            json_report = temporary / "report.json"
+            with mock.patch.object(
+                sys,
+                "argv",
+                [
+                    str(SCRIPT_PATH),
+                    "--repo-root",
+                    str(repository),
+                    "--generated-site",
+                    str(generated_site),
+                    "--format",
+                    "markdown",
+                    "--output",
+                    str(markdown_report),
+                    "--json-output",
+                    str(json_report),
+                ],
+            ):
+                self.assertEqual(orphan_images.main(), 0)
+
+            structured = json.loads(json_report.read_text(encoding="utf-8"))
+            self.assertEqual(structured["safe_deletions"], [image])
+            self.assertIn("Safe automatic deletions | 1", markdown_report.read_text())
+
+            changes_report = temporary / "changes.md"
+            with mock.patch.object(
+                sys,
+                "argv",
+                [
+                    str(SCRIPT_PATH),
+                    "--repo-root",
+                    str(repository),
+                    "--apply-cleanup",
+                    str(json_report),
+                    "--format",
+                    "markdown",
+                    "--output",
+                    str(changes_report),
+                ],
+            ):
+                self.assertEqual(orphan_images.main(), 0)
+
+            self.assertFalse(image_path.exists())
+            deleted = subprocess.check_output(
+                [
+                    "git",
+                    "-C",
+                    str(repository),
+                    "diff",
+                    "--cached",
+                    "--name-only",
+                    "--diff-filter=D",
+                ],
+                text=True,
+            ).splitlines()
+            self.assertEqual(deleted, [image])
+            self.assertIn("Staged 1 verified image deletion", changes_report.read_text())
 
 
 if __name__ == "__main__":
