@@ -1,4 +1,4 @@
-name: Image integrity
+name: Orphaned images cleanup
 
 on:
   schedule:
